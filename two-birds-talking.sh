@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# two-birds-talking.sh -- Daily async debrief between two LLM agents
+# two-birds-talking.sh v2 -- Daily async debrief between two LLM agents
 # Agents alternate who asks first (odd days = A, even days = B).
-# Supports multi-turn dialogue (configurable 1-20 turns).
+# v2: 48-hour lookback window, configurable ground rules, rerun mode, retry logic.
 # Works with Anthropic, OpenAI-compatible, and Ollama APIs.
-set -e
+# Pollock 2026. cogpros.
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
 CONFIG_FILE="$SCRIPT_DIR/config.sh"
+
+# Detect OS for date commands (macOS vs Linux)
+if [[ "$(uname)" == "Darwin" ]]; then
+  date_offset() { date -v-${1}d '+%Y-%m-%d'; }
+else
+  date_offset() { date -d "$1 days ago" '+%Y-%m-%d'; }
+fi
 
 TODAY=$(date '+%Y-%m-%d')
 DAY_NUM=$(date '+%-d')
@@ -51,13 +58,31 @@ fi
 if [[ "$TURNS" -lt 1 ]]; then TURNS=1; fi
 if [[ "$TURNS" -gt 20 ]]; then TURNS=20; fi
 
+# --- Compute lookback dates ---
+LOOKBACK_DAYS="${LOOKBACK_DAYS:-3}"
+LOOKBACK_DATES=()
+for (( i=LOOKBACK_DAYS-1; i>=0; i-- )); do
+  LOOKBACK_DATES+=("$(date_offset "$i")")
+done
+
+YESTERDAY="$(date_offset 1)"
+REVIEW_WINDOW="$(date_offset $((LOOKBACK_DAYS-1))) through ${TODAY} $(date '+%H:%M')"
+
+log "Review window: $REVIEW_WINDOW"
+
 # --- Create debriefs dir ---
 mkdir -p "$DEBRIEFS_DIR"
 
-# --- Check if today's debrief exists ---
-if [[ -f "$DEBRIEFS_DIR/$TODAY.md" ]]; then
-  log "Debrief for $TODAY already exists. Skipping."
-  exit 0
+# --- Rerun mode ---
+OUTPUT_FILE="$DEBRIEFS_DIR/$TODAY.md"
+if [[ "${TWO_BIRDS_RERUN:-0}" == "1" ]]; then
+  OUTPUT_FILE="$DEBRIEFS_DIR/$TODAY-rerun.md"
+  log "RERUN MODE: output to $OUTPUT_FILE"
+else
+  if [[ -f "$OUTPUT_FILE" ]]; then
+    log "Debrief for $TODAY already exists. Skipping. Set TWO_BIRDS_RERUN=1 to force."
+    exit 0
+  fi
 fi
 
 # --- Load recent debriefs for context ---
@@ -76,14 +101,47 @@ if [[ -z "$RECENT_CONTEXT" ]]; then
   RECENT_CONTEXT="No previous debriefs on file."
 fi
 
-# --- Load daily context if configured ---
+# --- Load daily context from lookback window ---
 DAILY_CONTEXT=""
-if [[ -n "$DAILY_CONTEXT_DIR" ]]; then
-  DAILY_FILE="$DAILY_CONTEXT_DIR/${TODAY}.md"
-  if [[ -f "$DAILY_FILE" ]]; then
-    DAILY_CONTEXT=$(cat "$DAILY_FILE")
-  fi
+if [[ -n "$DAILY_CONTEXT_DIRS" ]]; then
+  IFS=':' read -ra CONTEXT_DIR_LIST <<< "$DAILY_CONTEXT_DIRS"
+  for LOOKBACK_DATE in "${LOOKBACK_DATES[@]}"; do
+    for CONTEXT_DIR in "${CONTEXT_DIR_LIST[@]}"; do
+      CONTEXT_FILE="${CONTEXT_DIR}/${LOOKBACK_DATE}.md"
+      if [[ -f "$CONTEXT_FILE" ]]; then
+        if [[ "$LOOKBACK_DATE" == "$TODAY" ]]; then
+          LABEL="${LOOKBACK_DATE} (today, partial)"
+        elif [[ "$LOOKBACK_DATE" == "$YESTERDAY" ]]; then
+          LABEL="${LOOKBACK_DATE} (yesterday, primary review target)"
+        else
+          LABEL="${LOOKBACK_DATE}"
+        fi
+        DAILY_CONTEXT="${DAILY_CONTEXT}
+--- ${LABEL} ---
+$(cat "$CONTEXT_FILE")
+"
+      fi
+    done
+  done
 fi
+
+# --- Build ground rules string ---
+GROUND_RULES_STR=""
+if [[ ${#GROUND_RULES[@]} -gt 0 ]]; then
+  GROUND_RULES_STR="
+
+GROUND RULES (non-negotiable):"
+  for i in "${!GROUND_RULES[@]}"; do
+    GROUND_RULES_STR+="
+$((i+1)). ${GROUND_RULES[$i]}"
+  done
+fi
+
+# --- Build temporal frame ---
+TEMPORAL_FRAME="
+TEMPORAL FRAME: This is the morning debrief for ${TODAY}. You are reviewing the past ${LOOKBACK_DAYS} days (${REVIEW_WINDOW}). Yesterday (${YESTERDAY}) contains the primary session data and is your main review target. Today (${TODAY}) is still in progress. Its context file, if present, contains only partial data. Do not evaluate today as complete. Do not call any day a 'zero-session day' unless its context file is both complete and empty.
+
+Do not conflate work from separate sessions. A session that runs past midnight belongs to the day it started, not the day it ended. Check timestamps."
 
 # --- Determine who goes first ---
 if [[ "$IS_EVEN" -eq 0 ]]; then
@@ -124,8 +182,10 @@ log "Today is $TODAY (day $DAY_NUM). $FIRST_NAME opens, $SECOND_NAME responds. $
 CONTEXT_BLOCK="Recent debriefs for continuity:
 $RECENT_CONTEXT
 
-Today's context (if available):
-${DAILY_CONTEXT:-No daily context provided.}"
+Daily context (${REVIEW_WINDOW}):
+${DAILY_CONTEXT:-No daily context provided.}
+
+$(if [[ -n "${TWO_BIRDS_EXTRA_CONTEXT_FILE:-}" ]] && [[ -f "$TWO_BIRDS_EXTRA_CONTEXT_FILE" ]]; then echo "Additional context:"; cat "$TWO_BIRDS_EXTRA_CONTEXT_FILE"; fi)"
 
 # --- Unified API caller ---
 # call_api <provider> <endpoint> <api_key> <model> <system_msg> <user_msg> <temperature> <max_tokens>
@@ -157,7 +217,7 @@ call_api() {
 }
 JSONEOF
 )
-      response=$(curl -s -X POST "$endpoint" \
+      response=$(curl -s --max-time 120 -X POST "$endpoint" \
         -H "x-api-key: $api_key" \
         -H "anthropic-version: 2023-06-01" \
         -H "Content-Type: application/json" \
@@ -179,7 +239,6 @@ except Exception as e:
       ;;
 
     openai|ollama)
-      # OpenAI-compatible format (works with OpenAI, xAI, Groq, Together, Ollama)
       payload=$(cat <<JSONEOF
 {
   "model": "$model",
@@ -197,7 +256,7 @@ JSONEOF
         auth_args=(-H "Authorization: Bearer $api_key")
       fi
 
-      response=$(curl -s -X POST "$endpoint" \
+      response=$(curl -s --max-time 120 -X POST "$endpoint" \
         "${auth_args[@]}" \
         -H "Content-Type: application/json" \
         -d "$payload" 2>/dev/null) || true
@@ -226,13 +285,44 @@ except Exception as e:
   esac
 }
 
+# --- Check if result is an API error ---
+is_api_error() {
+  local result="$1"
+  [[ -z "$result" ]] || [[ "$result" == *"[API call failed:"* ]] || [[ "$result" == *"[API error:"* ]] || [[ "$result" == *"[Unknown provider:"* ]]
+}
+
+# --- Call with retry ---
+call_api_retry() {
+  local max_retries=3
+  local retry_delay=20
+  local attempt=1
+  local result
+
+  while [[ $attempt -le $max_retries ]]; do
+    result=$(call_api "$@")
+
+    if is_api_error "$result"; then
+      if [[ $attempt -lt $max_retries ]]; then
+        log "RETRY: Attempt $attempt failed. Waiting ${retry_delay}s..."
+        sleep "$retry_delay"
+        attempt=$((attempt + 1))
+      else
+        log "RETRY: Failed after $max_retries attempts."
+        echo "$result"
+        return 1
+      fi
+    else
+      echo "$result"
+      return 0
+    fi
+  done
+}
+
 # --- Build the conversation ---
 TRANSCRIPT=""
-LAST_MESSAGE=""
 
 for (( turn=1; turn<=TURNS; turn++ )); do
   if (( turn % 2 == 1 )); then
-    # First agent speaks
     SPEAKER_NAME="$FIRST_NAME"
     SPEAKER_PROVIDER="$FIRST_PROVIDER"
     SPEAKER_MODEL="$FIRST_MODEL"
@@ -241,14 +331,14 @@ for (( turn=1; turn<=TURNS; turn++ )); do
     OTHER_NAME="$SECOND_NAME"
 
     if [[ $turn -eq 1 ]]; then
-      SPEAKER_SYSTEM="$FIRST_SYSTEM_ASK"
+      SPEAKER_SYSTEM="${FIRST_SYSTEM_ASK}${TEMPORAL_FRAME}${GROUND_RULES_STR}"
       PROMPT="You are generating today's debrief. You speak first. $OTHER_NAME will respond.
 
 $CONTEXT_BLOCK
 
 Based on the recent context and any patterns you see, open the conversation. Ask a question or make an observation that matters. No preamble."
     else
-      SPEAKER_SYSTEM="$FIRST_SYSTEM_ANSWER"
+      SPEAKER_SYSTEM="${FIRST_SYSTEM_ANSWER}${TEMPORAL_FRAME}${GROUND_RULES_STR}"
       PROMPT="Continuing today's debrief. Here is the conversation so far:
 
 $TRANSCRIPT
@@ -258,7 +348,6 @@ $CONTEXT_BLOCK
 Respond to what $OTHER_NAME just said. Push back if you disagree. Build on what's working. Ask a follow-up or shift to what matters next. Keep it focused."
     fi
   else
-    # Second agent speaks
     SPEAKER_NAME="$SECOND_NAME"
     SPEAKER_PROVIDER="$SECOND_PROVIDER"
     SPEAKER_MODEL="$SECOND_MODEL"
@@ -266,7 +355,7 @@ Respond to what $OTHER_NAME just said. Push back if you disagree. Build on what'
     SPEAKER_KEY="$SECOND_KEY"
     OTHER_NAME="$FIRST_NAME"
 
-    SPEAKER_SYSTEM="$SECOND_SYSTEM_ANSWER"
+    SPEAKER_SYSTEM="${SECOND_SYSTEM_ANSWER}${TEMPORAL_FRAME}${GROUND_RULES_STR}"
     PROMPT="Continuing today's debrief. Here is the conversation so far:
 
 $TRANSCRIPT
@@ -284,12 +373,12 @@ This is the final turn. Close with your strongest observation or carry-forward."
 
   log "Turn $turn/$TURNS: $SPEAKER_NAME..."
 
-  RESPONSE=$(call_api "$SPEAKER_PROVIDER" "$SPEAKER_ENDPOINT" "$SPEAKER_KEY" \
+  RESPONSE=$(call_api_retry "$SPEAKER_PROVIDER" "$SPEAKER_ENDPOINT" "$SPEAKER_KEY" \
     "$SPEAKER_MODEL" "$SPEAKER_SYSTEM" "$PROMPT" \
     "$([ $turn -eq 1 ] && echo $TEMPERATURE_ASK || echo $TEMPERATURE_ANSWER)" \
     "$([ $turn -eq 1 ] && echo $MAX_TOKENS_ASK || echo $MAX_TOKENS_ANSWER)")
 
-  if [[ -z "$RESPONSE" ]] || [[ "$RESPONSE" == *"[API call failed:"* ]] || [[ "$RESPONSE" == *"[API error:"* ]] || [[ "$RESPONSE" == *"[Unknown provider:"* ]]; then
+  if is_api_error "$RESPONSE"; then
     log "WARNING: $SPEAKER_NAME turn $turn returned: $RESPONSE"
     if [[ $turn -eq 1 ]]; then
       log "FATAL: Cannot start conversation. Exiting."
@@ -302,6 +391,8 @@ This is the final turn. Close with your strongest observation or carry-forward."
   TRANSCRIPT+="**${SPEAKER_NAME} (Turn ${turn}):**
 
 ${RESPONSE}
+
+---
 
 "
 
@@ -318,29 +409,33 @@ SYNTHESIS=""
 if [[ "$SYNTHESIZE" == "true" ]] && [[ -n "$TRANSCRIPT" ]]; then
   log "Running synthesis pass..."
 
+  SYNTH_SYSTEM="${FIRST_SYSTEM_ANSWER} You are synthesizing a debrief into honest, grounded feedback. Be concrete, specific, and actionable.${TEMPORAL_FRAME}${GROUND_RULES_STR}"
+
   SYNTH_PROMPT="Here is today's full debrief between $FIRST_NAME and $SECOND_NAME:
 
 $TRANSCRIPT
 
-Distill this conversation into four sections. Be specific, not generic. Pull exact phrases and observations from the transcript.
+And here is the context that informed the conversation:
+$CONTEXT_BLOCK
+
+Distill this conversation into four sections. Be specific, not generic. Pull exact phrases and observations from the transcript. Summarize activity across the review window with yesterday (${YESTERDAY}) as the primary focus. Note any items from today's partial context separately.
 
 ## Key Observations
 - (3-5 bullets: the most important things said)
 
 ## Patterns Flagged
-- (recurring themes, risks, or trends noticed)
+- (recurring themes, risks, or trends noticed across the review window)
 
 ## Action Items
-- (concrete next steps that emerged)
+- (concrete next steps that emerged, only items not gated by external dependencies)
 
 ## Insight
 (One sentence. The single sharpest takeaway from this conversation.)"
 
-  SYNTHESIS=$(call_api "$FIRST_PROVIDER" "$FIRST_ENDPOINT" "$FIRST_KEY" \
-    "$FIRST_MODEL" "You are a precise analyst. Extract structure from conversation. No filler." \
-    "$SYNTH_PROMPT" 0.3 800)
+  SYNTHESIS=$(call_api_retry "$FIRST_PROVIDER" "$FIRST_ENDPOINT" "$FIRST_KEY" \
+    "$FIRST_MODEL" "$SYNTH_SYSTEM" "$SYNTH_PROMPT" 0.3 1000)
 
-  if [[ -z "$SYNTHESIS" ]] || [[ "$SYNTHESIS" == *"[API call failed:"* ]] || [[ "$SYNTHESIS" == *"[API error:"* ]]; then
+  if is_api_error "$SYNTHESIS"; then
     log "ERROR: Synthesis failed. Response: $SYNTHESIS"
     SYNTHESIS="[Synthesis failed. Check logs.]"
   else
@@ -349,33 +444,79 @@ Distill this conversation into four sections. Be specific, not generic. Pull exa
 fi
 
 # --- Save to file ---
-cat > "$DEBRIEFS_DIR/$TODAY.md" << DEBRIEF_EOF
-# Two Birds Talking -- $(date '+%B %d, %Y')
-**$FIRST_NAME** opens, **$SECOND_NAME** responds. $TURNS turn(s).
+TRANSCRIPT_FILE=$(mktemp /tmp/tbt-transcript.XXXXXX)
+SYNTHESIS_FILE=$(mktemp /tmp/tbt-synthesis.XXXXXX)
+printf '%s' "$TRANSCRIPT" > "$TRANSCRIPT_FILE"
+printf '%s' "$SYNTHESIS" > "$SYNTHESIS_FILE"
+
+python3 - "$OUTPUT_FILE" "$FIRST_NAME" "$SECOND_NAME" "$TURNS" "$REVIEW_WINDOW" "$TRANSCRIPT_FILE" "$SYNTHESIS_FILE" << 'PYEOF'
+import sys
+from datetime import datetime
+
+path = sys.argv[1]
+first = sys.argv[2]
+second = sys.argv[3]
+turns = sys.argv[4]
+window = sys.argv[5]
+
+with open(sys.argv[6]) as f:
+    transcript = f.read()
+with open(sys.argv[7]) as f:
+    synthesis = f.read()
+
+date_str = datetime.now().strftime("%B %d, %Y")
+generated = datetime.now().isoformat()
+
+content = f"""---
+generated: {generated}
+review_window: {window}
+---
+
+# Two Birds Talking -- {date_str}
+**{first}** opens, **{second}** responds. {turns} turn(s). Review window: {window}.
 
 ---
 
-$TRANSCRIPT
-${SYNTHESIS:+---
+## Transcript
 
-$SYNTHESIS}
-DEBRIEF_EOF
+{transcript}
 
-log "Debrief saved to $DEBRIEFS_DIR/$TODAY.md"
+## Synthesis
+
+{synthesis}
+"""
+
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+
+rm -f "$TRANSCRIPT_FILE" "$SYNTHESIS_FILE"
+
+if [[ ! -f "$OUTPUT_FILE" ]]; then
+  log "FATAL: Failed to save debrief file"
+  exit 1
+fi
+
+log "Debrief saved to $OUTPUT_FILE"
 
 # --- Sync to viewer ---
 SYNC_SCRIPT="$SCRIPT_DIR/two-birds-sync.sh"
 if [[ -x "$SYNC_SCRIPT" ]]; then
-  bash "$SYNC_SCRIPT" 2>/dev/null && log "Viewer synced." || log "Viewer sync failed (non-fatal)."
+  SYNC_OUT=$(bash "$SYNC_SCRIPT" 2>&1)
+  if [[ $? -eq 0 ]]; then
+    log "Viewer synced. $SYNC_OUT"
+  else
+    log "Viewer sync failed (non-fatal): $SYNC_OUT"
+  fi
 fi
 
 # --- Notify ---
 case "$NOTIFY_METHOD" in
   telegram)
     if [[ -n "$TELEGRAM_BOT_TOKEN" ]] && [[ -n "$TELEGRAM_CHAT_ID" ]]; then
-      curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      curl -s --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         -d chat_id="${TELEGRAM_CHAT_ID}" \
-        --data-urlencode "text=Two Birds Talking -- ${TODAY}. ${FIRST_NAME} opened, ${SECOND_NAME} responded. ${TURNS} turns." \
+        --data-urlencode "text=Two Birds Talking -- ${TODAY}. ${FIRST_NAME} opened, ${SECOND_NAME} responded. ${TURNS} turns. Window: ${REVIEW_WINDOW}." \
         >/dev/null 2>&1 || true
       log "Telegram notification sent."
     else
@@ -384,9 +525,8 @@ case "$NOTIFY_METHOD" in
     ;;
   discord)
     if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
-      local discord_msg
       discord_msg=$(printf '%s' "Two Birds Talking -- ${TODAY}. ${FIRST_NAME} opened, ${SECOND_NAME} responded. ${TURNS} turns." | python3 -c 'import sys,json; print(json.dumps({"content": sys.stdin.read()}))')
-      curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+      curl -s --max-time 10 -X POST "$DISCORD_WEBHOOK_URL" \
         -H "Content-Type: application/json" \
         -d "$discord_msg" \
         >/dev/null 2>&1 || true
