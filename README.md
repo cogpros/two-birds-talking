@@ -191,6 +191,8 @@ two-birds-talking/
 
 Built by Dustin Pollock as part of the [cogpros](https://github.com/cogpros) research program. Two agents debrief each other daily while the operator sleeps. The pattern turned out to be useful beyond its original context.
 
+See also: [hugr-solve](https://github.com/cogpros/hugr-solve), the heavier sibling. Same two-agent conversation engine, pointed at a single hard problem until convergence or deadlock.
+
 ## License
 
 MIT. See [LICENSE.txt](LICENSE.txt).
